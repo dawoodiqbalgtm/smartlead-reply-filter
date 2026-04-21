@@ -1,12 +1,9 @@
 // Smartlead reply webhook -> OOO filter -> Slack
-// Deploy to Vercel: `vercel --prod`
-//
-// Env vars required:
-//   SLACK_WEBHOOK_URL    Incoming webhook from slack.com/apps/A0F7XDUAZ
+// Deploy to Vercel. Env vars:
+//   SLACK_WEBHOOK_URL    Incoming webhook from api.slack.com/apps
 //   SMARTLEAD_SECRET     (optional) shared secret; if set, request must include ?secret=...
 
 const OOO_PATTERNS = [
-  // English
   /\bout\s+of\s+(the\s+)?office\b/i,
   /\bon\s+(vacation|holiday|leave|pto|annual\s+leave|parental\s+leave|maternity|paternity|sabbatical)\b/i,
   /\b(away|unavailable)\s+(from|until|through|between|this\s+week)\b/i,
@@ -21,83 +18,108 @@ const OOO_PATTERNS = [
   /\bno\s+longer\s+(with|employed)\b/i,
   /\bhas\s+left\s+the\s+company\b/i,
   /\bis\s+no\s+longer\s+with\s+(us|the\s+company|.{0,40})/i,
-  // Subject line markers
   /\b(auto:|automatic reply:|autoreply:|out of office:|ooo:)/i,
 ];
 
-// Header-level signals (most reliable)
-const OOO_HEADER_KEYS = [
-  "auto-submitted",       // RFC 3834: any value other than "no" = auto
-  "x-autoreply",
-  "x-autorespond",
-  "x-auto-response-suppress",
-  "precedence",           // "auto_reply", "bulk", "junk"
-];
+function s(v) {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "object") return String(v.text ?? v.html ?? "");
+  return String(v);
+}
 
-function isOOO({ subject = "", body = "", headers = {} }) {
-  const hay = `${subject}\n${body}`.slice(0, 4000);
+function htmlToText(html) {
+  return html
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
 
-  // 1. Header check
+function extractReplyText(reply) {
+  if (!reply) return "";
+  if (typeof reply === "string") return reply;
+  if (typeof reply === "object") {
+    if (reply.text) return String(reply.text);
+    if (reply.html) return htmlToText(String(reply.html));
+  }
+  return "";
+}
+
+function isOOO({ subject, body, headers }) {
+  const hay = `${s(subject)}\n${s(body)}`.slice(0, 4000);
+
   const h = {};
   if (headers && typeof headers === "object") {
-    for (const [k, v] of Object.entries(headers)) h[String(k).toLowerCase()] = String(v ?? "");
+    for (const [k, v] of Object.entries(headers)) h[String(k).toLowerCase()] = s(v);
   }
   if (h["auto-submitted"] && h["auto-submitted"].toLowerCase() !== "no") return true;
   if (h["x-autoreply"] || h["x-autorespond"]) return true;
   if (/auto[_-]?reply|bulk/i.test(h["precedence"] || "")) return true;
 
-  // 2. Pattern check
   return OOO_PATTERNS.some((re) => re.test(hay));
 }
 
-function stripQuoted(text = "") {
-  if (!text) return "";
-  // Cut at common reply/forward markers
+function stripQuoted(text) {
+  const t = s(text);
+  if (!t) return "";
   const markers = [
     /\n?On .{0,80} wrote:\s*\n/,
     /\n?-----\s*Original Message\s*-----/i,
     /\n?From:\s+.+\nSent:\s+.+\nTo:/i,
     /\n?>{1,}\s/,
+    /##-\s*Please type your reply above this line\s*-##/i,
   ];
-  let cut = text.length;
+  let cut = t.length;
   for (const m of markers) {
-    const match = text.match(m);
-    if (match && match.index < cut) cut = match.index;
+    const match = t.match(m);
+    if (match && match.index != null && match.index < cut) cut = match.index;
   }
-  return text.slice(0, cut).trim();
+  return t.slice(0, cut).trim();
 }
 
-function buildSlackMessage(payload) {
-  const leadName = [payload.lead_first_name, payload.lead_last_name].filter(Boolean).join(" ") || payload.lead_name || "(unknown)";
-  const leadEmail = payload.lead_email || payload.from_email || "";
-  const company = payload.lead_company || payload.company_name || "";
-  const campaign = payload.campaign_name || payload.campaign_id || "";
-  const subject = payload.subject || payload.reply_subject || "";
-  const body = stripQuoted(payload.reply_message || payload.reply_body || payload.message || payload.body || "");
-  const threadLink = payload.message_url || payload.thread_url || payload.smartlead_url ||
-    (payload.campaign_id && payload.lead_id
-      ? `https://app.smartlead.ai/app/master-inbox/${payload.campaign_id}/${payload.lead_id}`
-      : "");
+function buildSlackMessage(p) {
+  const leadName =
+    [p.lead_first_name, p.lead_last_name].filter(Boolean).join(" ") ||
+    p.lead_name ||
+    p.to_name ||
+    s(p.sl_lead_email) ||
+    s(p.to_email) ||
+    "(unknown)";
+  const leadEmail = s(p.sl_lead_email) || s(p.to_email) || s(p.lead_email) || "";
+  const company = s(p.lead_company) || s(p.company_name) || "";
+  const campaign = s(p.campaign_name) || (p.campaign_id != null ? String(p.campaign_id) : "");
+  const subject = s(p.subject) || s(p.reply_subject);
+  const body = stripQuoted(extractReplyText(p.reply_message) || s(p.reply_body) || s(p.message) || s(p.body));
+  const threadLink = s(p.app_url) || s(p.message_url) || s(p.thread_url) || s(p.smartlead_url) || "";
 
-  const headerLine = `📬 *New reply from ${leadName}* <mailto:${leadEmail}|${leadEmail}>`;
-  const metaLine = [company && `*Company:* ${company}`, campaign && `*Campaign:* ${campaign}`, subject && `*Subject:* ${subject}`]
-    .filter(Boolean)
-    .join("  |  ");
+  const headerText = leadEmail
+    ? `📬 *New reply from ${leadName}* <mailto:${leadEmail}|${leadEmail}>`
+    : `📬 *New reply from ${leadName}*`;
 
-  const blocks = [
-    { type: "section", text: { type: "mrkdwn", text: headerLine } },
-  ];
-  if (metaLine) blocks.push({ type: "section", text: { type: "mrkdwn", text: metaLine } });
+  const metaBits = [];
+  if (company) metaBits.push(`*Company:* ${company}`);
+  if (campaign) metaBits.push(`*Campaign:* ${campaign}`);
+  if (subject) metaBits.push(`*Subject:* ${subject}`);
+
+  const blocks = [{ type: "section", text: { type: "mrkdwn", text: headerText } }];
+  if (metaBits.length) blocks.push({ type: "section", text: { type: "mrkdwn", text: metaBits.join("  |  ") } });
   blocks.push({ type: "divider" });
-  // Slack mrkdwn block text cap is 3000 chars; split the body if needed.
-  const chunks = [];
+
   let rest = body || "(empty body)";
   while (rest.length > 2900) {
-    chunks.push(rest.slice(0, 2900));
+    blocks.push({ type: "section", text: { type: "mrkdwn", text: rest.slice(0, 2900) } });
     rest = rest.slice(2900);
   }
-  chunks.push(rest);
-  for (const c of chunks) blocks.push({ type: "section", text: { type: "mrkdwn", text: c } });
+  blocks.push({ type: "section", text: { type: "mrkdwn", text: rest } });
+
   if (threadLink) {
     blocks.push({ type: "divider" });
     blocks.push({
@@ -138,11 +160,12 @@ export default async function handler(req, res) {
       return res.status(200).json({ skipped: "non-reply event", eventType });
     }
 
-    const subject = String(p.subject || p.reply_subject || "");
-    const body = String(p.reply_message || p.reply_body || p.message || p.body || "");
+    const replyText = extractReplyText(p.reply_message) || s(p.reply_body) || s(p.message) || s(p.body);
+    const subject = s(p.subject) || s(p.reply_subject);
     const headers = p.reply_headers || p.headers || {};
 
-    if (isOOO({ subject, body, headers })) {
+    if (isOOO({ subject, body: replyText, headers })) {
+      console.log("skipped as OOO");
       return res.status(200).json({ skipped: "ooo" });
     }
 
