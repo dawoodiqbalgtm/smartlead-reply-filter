@@ -39,10 +39,12 @@ function isOOO({ subject = "", body = "", headers = {} }) {
 
   // 1. Header check
   const h = {};
-  for (const [k, v] of Object.entries(headers || {})) h[k.toLowerCase()] = String(v || "");
+  if (headers && typeof headers === "object") {
+    for (const [k, v] of Object.entries(headers)) h[String(k).toLowerCase()] = String(v ?? "");
+  }
   if (h["auto-submitted"] && h["auto-submitted"].toLowerCase() !== "no") return true;
   if (h["x-autoreply"] || h["x-autorespond"]) return true;
-  if ((h["precedence"] || "").toLowerCase().match(/auto[_-]?reply|bulk/)) return true;
+  if (/auto[_-]?reply|bulk/i.test(h["precedence"] || "")) return true;
 
   // 2. Pattern check
   return OOO_PATTERNS.some((re) => re.test(hay));
@@ -128,26 +130,26 @@ export default async function handler(req, res) {
   }
 
   const p = req.body || {};
-
-  // Only act on reply events. Smartlead sends other events (open, click, bounce) too.
-  const eventType = (p.event_type || p.event || p.webhook_type || "").toLowerCase();
-  if (eventType && !eventType.includes("reply")) {
-    return res.status(200).json({ skipped: "non-reply event", eventType });
-  }
-
-  const subject = p.subject || p.reply_subject || "";
-  const body = p.reply_message || p.reply_body || p.message || p.body || "";
-  const headers = p.reply_headers || p.headers || {};
-
-  if (isOOO({ subject, body, headers })) {
-    return res.status(200).json({ skipped: "ooo" });
-  }
+  console.log("payload:", JSON.stringify(p).slice(0, 2000));
 
   try {
+    const eventType = String(p.event_type || p.event || p.webhook_type || "").toLowerCase();
+    if (eventType && !eventType.includes("reply")) {
+      return res.status(200).json({ skipped: "non-reply event", eventType });
+    }
+
+    const subject = String(p.subject || p.reply_subject || "");
+    const body = String(p.reply_message || p.reply_body || p.message || p.body || "");
+    const headers = p.reply_headers || p.headers || {};
+
+    if (isOOO({ subject, body, headers })) {
+      return res.status(200).json({ skipped: "ooo" });
+    }
+
     await postToSlack(buildSlackMessage(p));
     return res.status(200).json({ ok: true });
   } catch (e) {
-    console.error("slack post failed:", e.message);
+    console.error("handler error:", e.stack || e.message);
     return res.status(502).json({ error: e.message });
   }
 }
